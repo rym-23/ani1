@@ -1,0 +1,943 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>For You</title>
+<style>
+@font-face{font-family:"DotMatrix";src:url("./fonts/DotMatrix.ttf") format("truetype");font-display:block}
+html,body{margin:0;height:100%;background:#020103;overflow:hidden}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center}
+canvas{display:block;cursor:default}
+canvas.hot{cursor:pointer}
+#card{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(2,1,3,.88);z-index:5}
+#card.on{display:flex;animation:fade .6s ease}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+#letter{box-sizing:border-box;max-width:min(560px,90vw);max-height:76vh;overflow:auto;padding:28px 32px;border:1px dashed #b5507a;color:#f2c6da;font:15px/1.6 "DotMatrix",monospace;white-space:pre-wrap;background:#06030a;box-shadow:0 0 40px rgba(255,90,150,.18)}
+#close{display:block;margin:18px auto 0;background:none;border:1px solid #b5507a;color:#f2c6da;font:14px monospace;padding:6px 14px;cursor:pointer}
+#hint{position:fixed;bottom:10px;left:0;right:0;text-align:center;color:#4d4459;font:12px system-ui,sans-serif;letter-spacing:.05em;user-select:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">Pulsa R para verla de nuevo</div>
+<div id="card"><div><div id="letter"></div><button id="close">cerrar</button></div></div>
+<script>
+"use strict";
+const canvas = document.getElementById("c"), ctx = canvas.getContext("2d");
+const MONO = '"Cascadia Mono", Consolas, "Courier New", "DejaVu Sans Mono", monospace';
+const D2R = Math.PI / 180, ROWS = 46, NB = 720, NCH = 3, LV = 40;
+const T_ENV_IN = 1.6, T_CUR0 = 1.9, T_CUR1 = 4.1, T_CLICK = 4.55, T_BURN = T_CLICK + 0.12;
+const T_SPREAD = 3.4, T_R0 = T_BURN + 2.3, T_FORM = 3.8, T_GLOW = T_R0 + 1.8, T_FIRE_END = T_BURN + T_SPREAD + 2.2;
+const BG = [0.010, 0.007, 0.012];
+
+const clamp = (v, lo = 0, hi = 1) => v < lo ? lo : v > hi ? hi : v;
+const ease = t => { t = clamp(t); return t * t * (3 - 2 * t); };
+const mix = (a, b, k) => [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
+const sc = (c, k) => [c[0] * k, c[1] * k, c[2] * k];
+const pmod = (x, m) => ((x % m) + m) % m;
+const K = (r, c) => r * 4096 + c;
+const put = (m, r, c, ch, col) => m.set(K(r, c), { r, c, ch, col });
+const hexcache = new Map();
+function hexc(c) {
+  const k = [0, 1, 2].map(i => Math.trunc(clamp(c[i]) * (LV - 0.01)));
+  const key = (k[0] * LV + k[1]) * LV + k[2];
+  let s = hexcache.get(key);
+  if (!s) {
+    const f = v => Math.trunc(v * 255 / (LV - 1));
+    s = `rgb(${f(k[0])},${f(k[1])},${f(k[2])})`;
+    hexcache.set(key, s);
+  }
+  return s;
+}
+function rampLut(stops, n = 64) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const v = i / (n - 1);
+    for (let k = 0; k < stops.length - 1; k++) {
+      const [a, ca] = stops[k], [b, cb] = stops[k + 1];
+      if (v <= b) { out.push(mix(ca, cb, (v - a) / (b - a))); break; }
+    }
+  }
+  return out;
+}
+const FIRE = [[0, [.30, .01, 0]], [.18, [.78, .05, .01]], [.38, [1, .24, .02]], [.60, [1, .52, .05]], [.80, [1, .80, .26]], [1, [1, .98, .82]]];
+const REDS = [[0, [.10, 0, .02]], [.22, [.34, .01, .05]], [.45, [.66, .04, .09]], [.68, [.90, .09, .15]], [.88, [1, .24, .26]], [1, [1, .55, .52]]];
+const BLUES = [[0, [.01, .03, .16]], [.25, [.03, .14, .52]], [.50, [.10, .38, .95]], [.75, [.50, .78, 1]], [1, [1, 1, 1]]];
+const LUT = rampLut(FIRE), RLUT = rampLut(REDS), BLUE = rampLut(BLUES);
+const RCH = "-=+*#%&@8", PAPER = "#%&@8", BGRAMP = ".:-=+*#", SMOKE_C = [.5, .44, .44];
+const LIGHTC = [.55, .75, 1], WHITE = [.95, .98, 1];
+const FLAPC = [.85, .67, .44], SIDEC = [.66, .48, .29], BOTC = [.78, .60, .38], INK = [.14, .08, .05], INKT = [.24, .12, .06];
+const STRIPE = [[.74, .17, .15], [.93, .88, .76], [.17, .29, .64]];
+const GLYPH = { F: ["###", "#..", "##.", "#..", "#.."], O: ["###", "#.#", "#.#", "#.#", "###"], R: ["##.", "#.#", "##.", "#.#", "#.#"], Y: ["#.#", "#.#", ".#.", ".#.", ".#."], U: ["#.#", "#.#", "#.#", "#.#", "###"], " ": ["...", "...", "...", "...", "..."] };
+const LAYERS = [[1, 5, 0, .17], [.82, 5, .9, .16], [.65, 4, 1.7, .15], [.49, 3, 2.4, .13]];
+const LBASE = [.34, .40, .46, .52], SPIR_R = .30;
+const SEPALS = [[-.55, 1, 212, 1, .13, -.10], [-.22, 1.1, 245, .9, .11, -.08], [.55, 1, -32, 1, .13, .10], [.22, 1.1, -65, .9, .11, .08], [0, 1.15, 270, .72, .10, 0]];
+const LEAVES = [[2.10, 150, 1.55, .36, .16], [2.70, 28, 1.45, .33, -.14], [3.10, 155, 1.10, .26, .12]];
+const GREEN_D = [.03, .14, .05], GREEN_L = [.14, .45, .18];
+const FSET = [null, ".'", ":.", "^'", "^*", "*(", "(+)", "%&", "#%", "#@", "@"];
+const ARW = [[0, 0], [0, .86], [.19, .69], [.31, .99], [.44, .93], [.32, .65], [.58, .65]];
+
+let W, H, CX, CW, CH, COLS, S, FONT, rng, frame, t0, last;
+let EW, EH, ECY, EX0, EX1, EY0, EY1, FLAP_H, HR, HCY, XPL, XPR, YPL, IGX, IGY;
+let TXT, TW, TC0, TR0, MAXD, ENVC, ENV_SORTED, TBS, SHDC, SEALC, BED, SHD;
+let RX, RR, RY, STEM_Y1, HEAD_B, TOP_Y, STEM_HW, THORNS, ROSEMASK, EDGE, HALO, ROSEC, RP;
+let BGE, BGCH, BGC, RAYF, RAYM, STARS, MOTES, TGX, TGY, POLY, PH_;
+let CUR_FILL, CUR_EDGE, CUR_GLOW, CUR_SHAD, _P, _N, HS, HS2, HEAT;
+let items_unused, sparks, smoke, bits, st;
+
+function makeRng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const uni = (a, b) => a + (b - a) * rng();
+const ri = n => Math.floor(rng() * n);
+const inb = (r, c) => r >= 0 && r < ROWS && c >= 0 && c < COLS;
+
+function vn(x, y) {
+  const x0 = Math.floor(x), y0 = Math.floor(y), xf = x - x0, yf = y - y0;
+  const xi = x0 & 255, yi = y0 & 255, x1 = (xi + 1) & 255, y1 = (yi + 1) & 255;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = _N[_P[(_P[xi] + yi) & 255]], b = _N[_P[(_P[x1] + yi) & 255]];
+  const c = _N[_P[(_P[xi] + y1) & 255]], d = _N[_P[(_P[x1] + y1) & 255]];
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+const nz = (t, a = 1) => (Math.sin(t * 2.1 * a) + 0.7 * Math.sin(t * 3.3 * a + 1.7) + 0.4 * Math.sin(t * 5.7 * a + 0.6)) / 2.1;
+
+function heartF(hx, hy, s) {
+  const X = hx / s, Y = (hy - 0.25) / s + 0.25;
+  return (X * X + Y * Y - 1) ** 3 - X * X * Y ** 3;
+}
+const inSeal = (x, y) => {
+  const hx = (x - CX) / HR, hy = (HCY - y) / HR;
+  return -1.4 < hx && hx < 1.4 && -1.3 < hy && hy < 1.6 && heartF(hx, hy, 1) <= 0;
+};
+const GL = Object.keys(GLYPH);
+function ink(r, c) {
+  const px = Math.floor((c - TC0) / 2), py = r - TR0;
+  return c >= TC0 && px >= 0 && px < TW && py >= 0 && py < 5 && TXT[py][px] === "#";
+}
+
+function envStyle(r, c, x, y, hs, hs2) {
+  if (x < EX0 || x > EX1 || y < EY0 || y > EY1) return null;
+  const hx = (x - CX) / HR, hy = (HCY - y) / HR;
+  if (inSeal(x, y)) {
+    const k = clamp(0.5 - 0.30 * hx + 0.28 * hy);
+    if (heartF(hx, hy, 0.9) > 0) return ["#", [.50, .13, .28]];
+    if (heartF(hx, hy, 0.7) > 0) return ["&%#"[Math.floor(hs * 3) % 3], mix([.86, .40, .58], [1, .74, .86], k)];
+    if ((hx + 0.4) ** 2 + (hy - 0.6) ** 2 < 0.045) return ["*", [1, .93, .97]];
+    return ["@%"[hs2 > 0.82 ? 1 : 0], mix([.74, .24, .44], [.97, .60, .76], k)];
+  }
+  if (ink(r, c)) return ["@", INKT];
+  if (ink(r - 1, c - 1)) return ["%", [.45, .29, .15]];
+  const fh = FLAP_H * (1 - Math.abs(x - CX) / (EW / 2));
+  const dfl = EY0 + fh - y;
+  if (Math.abs(dfl) < 0.45 * CH) return [x < CX ? "\\" : "/", INK];
+  let side = false;
+  if (dfl < 0) {
+    if (x <= XPL) {
+      const yl = EY1 + (YPL - EY1) * (x - EX0) / (XPL - EX0);
+      if (Math.abs(y - yl) < 0.45 * CH) return ["/", INK];
+      side = y < yl;
+    } else if (x >= XPR) {
+      const yr = YPL + (EY1 - YPL) * (x - XPR) / (EX1 - XPR);
+      if (Math.abs(y - yr) < 0.45 * CH) return ["\\", INK];
+      side = y < yr;
+    }
+  }
+  if (x < EX0 + 1.3 * CW || x > EX1 - 1.3 * CW || y < EY0 + 0.9 * CH || y > EY1 - 0.9 * CH)
+    return ["/", STRIPE[Math.floor(((c + r) % 6) / 2)]];
+  const base = dfl >= 0 ? FLAPC : side ? SIDEC : BOTC;
+  let k = (1.06 - 0.20 * (y - EY0) / EH) * (0.88 + 0.24 * hs2);
+  if (dfl < 0 && dfl > -1.4 * CH) k *= 0.72 + 0.20 * (-dfl) / (1.4 * CH);
+  else if (0.45 * CH < dfl && dfl < 1.4 * CH) k *= 1.07;
+  return [PAPER[Math.floor(hs * PAPER.length) % PAPER.length], sc(base, k)];
+}
+
+function leafHit(x, y, ax, ay, ang, L, Wd, bend) {
+  const ca = Math.cos(ang * D2R), sa = Math.sin(ang * D2R);
+  const dx = x - ax, dy = y - ay;
+  const s = (dx * ca - dy * sa) / L;
+  if (s < 0 || s > 1) return null;
+  const v = dx * sa + dy * ca - bend * L * s * s;
+  const w = Wd * Math.sin(Math.PI * s ** 0.7) * (1 + 0.07 * Math.sin(s * 38));
+  if (w <= 0.3 || Math.abs(v) > w) return null;
+  return [s, v / w];
+}
+function layerB(k, th) {
+  const [R, n, ph, amp] = LAYERS[k];
+  const s = pmod((th + ph) * n / (2 * Math.PI), 1);
+  return [R * (1 - amp * (1 - s ** 0.55)), s];
+}
+const stemX = y => RX + 0.016 * H * Math.sin((y - RY) / (0.17 * H));
+
+function roseSample(x, y) {
+  const dx = x - RX, dy = y - RY;
+  for (const [ax, ay, ang, L, Wd, bend] of SEPALS) {
+    const h = leafHit(x, y, RX + ax * RR, RY + ay * RR, ang, L * RR, Wd * RR, bend);
+    if (h) return ["sepal", h[0], h[1]];
+  }
+  const ex = dx / RR, ey = dy / (RR * 0.84), uu = Math.hypot(ex, ey);
+  if (uu <= 1.18) {
+    const th = Math.atan2(ey, ex);
+    const Rth = 1 + 0.045 * Math.cos(5 * th + 0.7) + 0.03 * Math.cos(8 * th + 2.1);
+    const u = uu / Rth;
+    if (u <= 1) {
+      if (u < SPIR_R) return ["spiral", u / SPIR_R, th];
+      for (let k = LAYERS.length - 1; k >= 0; k--) if (u <= layerB(k, th)[0]) return ["petal", k, u, th];
+    }
+  }
+  const cx2 = dx / (RR * 0.78), cy2 = (dy - RR * 0.70) / (RR * 0.74);
+  if (cx2 * cx2 + cy2 * cy2 <= 1) return ["cup", cx2, cy2];
+  const rx = dx / (RR * 0.20), ry = (dy - RR * 1.42) / (RR * 0.18);
+  if (rx * rx + ry * ry <= 1) return ["recept", rx, ry];
+  if (HEAD_B - 0.1 * RR <= y && y <= STEM_Y1) {
+    const sxv = stemX(y);
+    if (Math.abs(x - sxv) <= STEM_HW) return ["stem", (x - sxv) / STEM_HW, y];
+    for (const [ty, sg] of THORNS) {
+      const f = (y - ty) / (0.028 * H);
+      if (f >= 0 && f <= 1) {
+        const e = (x - sxv) * sg - STEM_HW;
+        if (e >= 0 && e <= 2.6 * CW * f) return ["thorn", sg];
+      }
+    }
+    for (const [ay, ang, L, Wd, bend] of LEAVES) {
+      const ayy = RY + ay * RR;
+      const h = leafHit(x, y, stemX(ayy), ayy, ang, L * RR, Wd * RR, bend);
+      if (h) return ["leaf", h[0], h[1]];
+    }
+  }
+  return null;
+}
+const rch = I => RCH[Math.floor(clamp(0.20 + 0.80 * I) * (RCH.length - 0.01))];
+const contrast = I => clamp(0.52 + (I - 0.45) * 1.45);
+
+function roseStyle(smp, hs, hs2) {
+  const kind = smp[0];
+  if (kind === "spiral") {
+    const u = smp[1], th = smp[2], p = u * 2.6 + th / (2 * Math.PI), f = p - Math.floor(p);
+    let I = 0.26 + 0.62 * f ** 1.3;
+    if (f < 0.16) I *= 0.25 + f * 4.7;
+    I *= 0.60 + 0.40 * u;
+    I *= 0.74 + 0.52 * (0.5 + 0.5 * Math.cos(th + 2.36));
+    I = contrast(clamp(I * (0.94 + 0.12 * hs)));
+    return [rch(I), RLUT[Math.floor(I * 63)]];
+  }
+  if (kind === "petal") {
+    const k = smp[1], u = smp[2], th = smp[3];
+    const [b, s] = layerB(k, th), w = u / b;
+    let I = LBASE[k] + 0.30 * w ** 2;
+    if (w > 0.88) I += 0.34 * (w - 0.88) / 0.12;
+    const bn = k + 1 < LAYERS.length ? layerB(k + 1, th)[0] : SPIR_R, g = u - bn;
+    if (g < 0.10) I *= 0.25 + 7.5 * Math.max(0, g);
+    if (s < 0.16) I *= 0.40 + 3.75 * s;
+    else if (s > 0.92) I += 0.12;
+    I *= 0.72 + 0.56 * (0.5 + 0.5 * Math.cos(th + 2.36));
+    I = contrast(clamp(I * (0.94 + 0.12 * hs)));
+    if (hs2 > 0.985 && w > 0.5) return ["*", [1, .72, .66]];
+    return [rch(I), RLUT[Math.floor(I * 63)]];
+  }
+  if (kind === "cup") {
+    const cx2 = smp[1], cy2 = smp[2];
+    const seam = Math.abs(Math.sin((cx2 * 1.6 + cy2 * 0.4) * Math.PI * 1.5));
+    let I = 0.36 + 0.20 * (-cx2) + 0.08 * (-cy2);
+    I *= 0.55 + 0.45 * seam ** 0.6;
+    I *= 1 - 0.35 * (cx2 * cx2 + cy2 * cy2) * 0.8;
+    I = contrast(clamp(I * (0.9 + 0.2 * hs)));
+    return [rch(I), RLUT[Math.floor(I * 63)]];
+  }
+  if (kind === "recept") return ["@", mix([.06, .20, .08], [.14, .42, .17], clamp(0.5 - 0.5 * smp[1]))];
+  if (kind === "stem") return [hs < 0.85 ? "|" : ":", mix(GREEN_D, GREEN_L, clamp(0.5 - 0.5 * smp[1]))];
+  if (kind === "thorn") return [smp[1] > 0 ? ">" : "<", [.62, .12, .08]];
+  const s = smp[1], v = smp[2];
+  if (Math.abs(v) < 0.10) return [":", [.22, .62, .28]];
+  const vein = pmod(s * 7.0 - Math.abs(v) * 1.5, 1);
+  if (vein < 0.10 && kind === "leaf") return [":", [.17, .52, .22]];
+  let t_ = clamp(1 - Math.abs(v)) ** 1.2 * 0.8 + 0.2 * hs;
+  t_ *= 0.8 + 0.4 * (0.5 + 0.5 * v);
+  return ["#%&"[Math.floor(hs * 3) % 3], mix(GREEN_D, GREEN_L, clamp(t_))];
+}
+
+function pip(px, py) {
+  let ins = false, j = POLY.length - 1;
+  for (let i = 0; i < POLY.length; i++) {
+    const [xi, yi] = POLY[i], [xj, yj] = POLY[j];
+    if ((yi > py) !== (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi + 1e-9) + xi) ins = !ins;
+    j = i;
+  }
+  return ins;
+}
+function pdist(px, py) {
+  let best = 1e9;
+  for (let i = 0; i < POLY.length; i++) {
+    const [ax, ay] = POLY[i], [bx, by] = POLY[(i + 1) % POLY.length];
+    const vx = bx - ax, vy = by - ay, L2 = vx * vx + vy * vy + 1e-9;
+    const t_ = clamp(((px - ax) * vx + (py - ay) * vy) / L2);
+    best = Math.min(best, Math.hypot(px - (ax + vx * t_), py - (ay + vy * t_)));
+  }
+  return best;
+}
+
+function bgTables(tt) {
+  for (let i = 0; i < NB; i++) {
+    const a = -Math.PI + (i + 0.5) * (2 * Math.PI / NB);
+    const r1 = (0.5 + 0.5 * Math.sin(a * 23 + 1.6 * Math.sin(a * 3 + tt * 0.15) + tt * 0.10)) ** 6;
+    const r2 = (0.5 + 0.5 * Math.sin(a * 47 - tt * 0.12 + 1.5 * Math.sin(a * 5 - tt * 0.10))) ** 9;
+    const r3 = (0.5 + 0.5 * Math.sin(a * 11 + tt * 0.08)) ** 4;
+    RAYF[i] = 0.55 * r1 + 0.50 * r2 + 0.20 * r3;
+    let mn = 0;
+    for (let k = 0; k < 8; k++) {
+      const d = Math.abs(pmod(a - k * Math.PI / 4 + Math.PI, 2 * Math.PI) - Math.PI);
+      if (d < 0.3) mn += (k % 2 === 0 ? 1 : 0.65) * Math.exp(-((d / 0.045) ** 2)) * (0.88 + 0.12 * Math.sin(tt * 0.9 + k * 1.3));
+    }
+    RAYM[i] = mn;
+  }
+}
+function bgEval(e, tt, gt) {
+  const core = Math.exp(-e.dn * 2.8), glow = Math.exp(-e.dn * 1.3);
+  let I = (0.95 * core + 0.16 * glow + 0.62 * RAYF[e.ab] * Math.exp(-e.dn * 1.9) + 0.85 * RAYM[e.ab] * Math.exp(-e.dn * 1.05)) * gt;
+  if (e.halo) I *= 0.22;
+  if (I < 0.05) return null;
+  I = Math.min(I, 1.3);
+  return [BGRAMP[Math.min(BGRAMP.length - 1, Math.trunc(I * BGRAMP.length * 0.8))], BLUE[Math.floor(clamp(I) * 63)]];
+}
+
+function drawAmbient(t, dt, gt, nw) {
+  const base = 0.20 + 0.80 * gt;
+  for (const [rr, cc, ph, sp] of STARS) {
+    const v = 0.5 + 0.5 * Math.sin(t * sp + ph);
+    if (v > 0.35) {
+      const a = base * (v - 0.35) / 0.65;
+      put(nw, rr, cc, v > 0.9 ? "*" : v > 0.7 ? "+" : ".", sc(mix([.70, .85, 1], WHITE, v), 0.25 + 0.75 * a));
+    }
+  }
+  if (gt < 0.02) return;
+  for (const p of MOTES) {
+    p[1] -= p[2] * dt;
+    p[0] += 6 * S * Math.sin(t * 0.8 + p[3]) * dt;
+    if (p[1] < -4) { p[1] = H + 4; p[0] = uni(0, W); }
+    const rr = Math.floor(p[1] / CH), cc = Math.floor(p[0] / CW);
+    if (inb(rr, cc) && !ROSEMASK.has(K(rr, cc))) {
+      const v = gt * p[4] * (0.5 + 0.5 * Math.sin(t * 1.7 + p[3]));
+      if (v > 0.12) put(nw, rr, cc, v < 0.5 ? "." : ":", sc(mix(LIGHTC, WHITE, p[4]), 0.4 + 0.6 * v));
+    }
+  }
+}
+
+function ringCells(cx, cy, pad) {
+  const out = [];
+  for (let rr = Math.max(0, Math.floor((cy - pad) / CH)); rr < Math.min(ROWS, Math.floor((cy + pad) / CH) + 1); rr++) {
+    const y = (rr + 0.5) * CH;
+    for (let cc = Math.max(0, Math.floor((cx - pad) / CW)); cc < Math.min(COLS, Math.floor((cx + pad) / CW) + 1); cc++)
+      out.push([rr, cc, (cc + 0.5) * CW, y]);
+  }
+  return out;
+}
+function cursorPos(t) {
+  const s = clamp((t - T_CUR0) / (T_CUR1 - T_CUR0)), k = 1 - (1 - s) ** 3.5, u = 1 - k;
+  const p0 = [1.10 * W, 0.04 * H], p1 = [0.95 * W, 0.80 * H], p2 = [0.64 * W, 0.78 * H], p3 = [TGX, TGY];
+  const f = i => u ** 3 * p0[i] + 3 * u * u * k * p1[i] + 3 * u * k * k * p2[i] + k ** 3 * p3[i];
+  return [f(0), f(1)];
+}
+
+function drawClick(t, dt, nw) {
+  const a = t - T_CLICK;
+  if (!st.click && a >= 0) {
+    st.click = true;
+    for (let i = 0; i < 52; i++) {
+      const ang = uni(0, 2 * Math.PI), sp = uni(120, 560) * S;
+      bits.push([TGX, TGY, Math.cos(ang) * sp, Math.sin(ang) * sp, 0, uni(0.5, 1.1)]);
+    }
+  }
+  if (a < 0 || a > 1.2) return;
+  if (a < 0.25) {
+    const k = a / 0.25, rad = 0.03 * H + 0.05 * H * k;
+    for (const [rr, cc, x, y] of ringCells(TGX, TGY, rad + CW)) {
+      const d = Math.hypot(x - TGX, y - TGY);
+      if (d < rad) {
+        const v = (1 - k) * (1 - d / rad * 0.5), und = nw.get(K(rr, cc));
+        const col = mix([1, .9, 1], [.85, .5, 1], k);
+        put(nw, rr, cc, v > 0.5 ? "@" : "#", und ? mix(und.col, col, clamp(v * 1.3)) : sc(col, v));
+      }
+    }
+  }
+  const RINGS = [[0, [.65, .30, 1], [1, .55, .9]], [.13, [.55, .25, .95], [1, .65, .95]], [.26, [.50, .30, 1], [1, .85, 1]]];
+  for (const [d0, c0, c1] of RINGS) {
+    const aa = a - d0;
+    if (aa < 0 || aa > 0.9) continue;
+    const k = aa / 0.9, rad = 0.02 * H + 0.26 * H * (1 - (1 - k) ** 2.2), th = (1.7 - 1.0 * k) * CW;
+    const al = (1 - k) ** 1.2, col = mix(c0, c1, k);
+    for (const [rr, cc, x, y] of ringCells(TGX, TGY, rad + th)) {
+      const q = Math.abs(Math.hypot(x - TGX, y - TGY) - rad) / th;
+      if (q >= 1) continue;
+      const v = (1 - q) * al * 1.5, und = nw.get(K(rr, cc));
+      const c2 = und ? mix(und.col, col, clamp(v * 0.85)) : sc(col, clamp(v));
+      put(nw, rr, cc, q < 0.35 ? "O" : q < 0.65 ? "o" : ".", c2);
+    }
+  }
+  if (a < 0.55) {
+    const k = a / 0.55, l0 = 0.03 * H + 0.05 * H * k, l1 = 0.06 * H + 0.24 * H * (1 - (1 - k) ** 2);
+    const steps = Math.trunc((l1 - l0) / (CW * 0.9)) + 1;
+    for (let n = 0; n < 14; n++) {
+      const ang = n * 2 * Math.PI / 14 + 0.2, ca = Math.cos(ang), sa = Math.sin(ang);
+      const chr = Math.abs(ca) > 0.92 ? "-" : Math.abs(sa) > 0.92 ? "|" : ca * sa > 0 ? "\\" : "/";
+      for (let s_ = 0; s_ < steps; s_++) {
+        const f = s_ / steps, dist = l0 + (l1 - l0) * f;
+        const rr = Math.floor((TGY + sa * dist) / CH), cc = Math.floor((TGX + ca * dist) / CW);
+        if (inb(rr, cc)) put(nw, rr, cc, chr, sc(mix([1, .9, 1], [.7, .35, 1], f), clamp((1 - k) * (1 - 0.6 * f) * 1.3)));
+      }
+    }
+  }
+  const alive = [];
+  for (const b of bits) {
+    b[4] += dt;
+    if (b[4] >= b[5]) continue;
+    b[2] *= 1 - 2.0 * dt;
+    b[3] = b[3] * (1 - 2.0 * dt) + 60 * S * dt;
+    b[0] += b[2] * dt; b[1] += b[3] * dt;
+    const k = b[4] / b[5], rr = Math.floor(b[1] / CH), cc = Math.floor(b[0] / CW);
+    if (inb(rr, cc)) put(nw, rr, cc, k < 0.4 ? "*" : k < 0.7 ? "+" : ".", sc(mix([1, .92, 1], [.62, .28, .95], k), 1 - 0.5 * k));
+    alive.push(b);
+  }
+  bits = alive;
+}
+
+function drawCursor(t, nw) {
+  const a = clamp((t - T_CUR0) / 0.3), bt = t - T_BURN;
+  if (a <= 0 || bt > 1.1) return;
+  const [px, py] = cursorPos(t);
+  let c0 = Math.floor(px / CW), r0 = Math.floor(py / CH);
+  const press = T_CLICK <= t && t < T_CLICK + 0.20;
+  if (press) { c0++; r0++; }
+  const bk = bt > 0 ? clamp(bt) : 0;
+  if (T_CUR0 < t && t < T_CUR1 + 0.15) {
+    for (let q = 1; q <= 10; q++) {
+      const [tx, ty] = cursorPos(t - 0.05 * q);
+      const rr = Math.floor(ty / CH), cc = Math.floor(tx / CW);
+      if (inb(rr, cc)) { const v = (1 - q / 11) * 0.8; put(nw, rr, cc, q < 4 ? "+" : ".", [.58 * v, .24 * v, .95 * v]); }
+    }
+  }
+  for (const [j, i] of CUR_SHAD) {
+    const rr = r0 + j, cc = c0 + i;
+    if (inb(rr, cc) && bk < 0.5) { const und = nw.get(K(rr, cc)); put(nw, rr, cc, ":", mix(und ? und.col : BG, [.03, .01, .06], 0.65 * a)); }
+  }
+  for (const [j, i, g, hh] of CUR_GLOW) {
+    const rr = r0 + j, cc = c0 + i;
+    if (inb(rr, cc) && hh < 0.7 && bk < 0.6) { const v = a * g * (1 - bk) * 0.85; put(nw, rr, cc, g > 0.5 ? ":" : ".", [.55 * v, .18 * v, .78 * v]); }
+  }
+  for (const [j, i, hh] of CUR_EDGE) {
+    if (hh < bk) continue;
+    const rr = r0 + j, cc = c0 + i;
+    if (!inb(rr, cc)) continue;
+    let col = press ? [1, 1, 1] : [.98, .86, 1];
+    if (bk > 0) col = mix(col, LUT[Math.floor(clamp(0.55 + 0.4 * (1 - hh)) * 63)], clamp(bk * 1.6));
+    put(nw, rr, cc, "#", sc(col, a));
+  }
+  for (const [j, i, ch, col0, hh] of CUR_FILL) {
+    if (hh < bk) continue;
+    const rr = r0 + j, cc = c0 + i;
+    if (!inb(rr, cc)) continue;
+    let col = press ? mix(col0, [1, .96, 1], 0.55) : col0;
+    if (bk > 0) col = mix(col, LUT[Math.floor(clamp(0.55 + 0.4 * (1 - hh)) * 63)], clamp(bk * 1.6));
+    put(nw, rr, cc, ch, sc(col, a));
+  }
+}
+
+function bedK(t) {
+  const a = clamp((t - (T_BURN + 0.25)) / 1.2), b = clamp((t - (T_BURN + T_SPREAD + 0.6)) / 1.6);
+  return ease(a) * (1 - ease(b));
+}
+function fireStep(src, t) {
+  const out = new Map();
+  if (src.size === 0 && !st.hot) return out;
+  const last = COLS - 1;
+  let anyhot = false;
+  for (let r = 0; r < ROWS; r++) {
+    const row = HEAT[r], b1 = HEAT[r + 1], b2 = HEAT[r + 2];
+    for (let c = 0; c < COLS; c++) {
+      const q = rng();
+      let w = q < 0.27 ? c - 1 : q > 0.73 ? c + 1 : c;
+      if (w < 0) w = 0; else if (w > last) w = last;
+      const cl = c > 0 ? c - 1 : 0, cr = c < last ? c + 1 : last;
+      const v = (b1[w] * 2 + b1[cl] + b1[cr] + b2[c]) * 0.2 - (0.030 + 0.062 * pmod(q * 7.0, 1));
+      row[c] = v > 0 ? v : 0;
+    }
+  }
+  for (const [r, c, v] of src.values()) if (v > HEAT[r][c]) HEAT[r][c] = v;
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const v = HEAT[r][c];
+      if (v > 0.10) {
+        anyhot = true;
+        const s_ = FSET[Math.min(10, Math.trunc(v * 10.5))];
+        put(out, r, c, s_[(c * 3 + r * 7 + frame) % s_.length], LUT[Math.floor(clamp(v) * 63)]);
+      } else if (v > 0.01) anyhot = true;
+    }
+  }
+  st.hot = anyhot;
+  return out;
+}
+
+function fpos(f, s) {
+  const e = s * s * (3 - 2 * s), sn = Math.sin(Math.PI * s);
+  return [
+    f.sx + (f.tx - f.sx) * e + f.nx * f.amp * sn + 3 * S * Math.sin(s * 13 + f.ph) * (1 - s),
+    f.sy + (f.ty - f.sy) * e + f.ny * f.amp * sn - f.lift * sn,
+  ];
+}
+function bisectRight(a, x) {
+  let lo = 0, hi = a.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (x < a[mid]) hi = mid; else lo = mid + 1; }
+  return lo;
+}
+
+function render(t, dt) {
+  frame++;
+  const nw = new Map();
+  const gt = ease((t - T_GLOW) / 3.6);
+  if (gt > 0.003) {
+    if (frame % NCH === 0 || BGC.size === 0) bgTables(t);
+    for (const e of BGCH[frame % NCH]) {
+      const res = bgEval(e, t, gt), k = K(e.r, e.c);
+      if (res) BGC.set(k, { r: e.r, c: e.c, ch: res[0], col: res[1] }); else BGC.delete(k);
+    }
+    for (const [k, v] of BGC) nw.set(k, v);
+  }
+  drawAmbient(t, dt, gt, nw);
+
+  const tbn = t - T_BURN, pin = clamp(t / T_ENV_IN);
+  for (const [r, c, ch, col, tb, hs] of SHDC) {
+    if (tbn - tb >= 0) continue;
+    const vis = pin * 1.3 - hs * 0.5;
+    if (vis > 0) put(nw, r, c, ch, sc(col, Math.min(1, vis * 1.6)));
+  }
+
+  const front = [], src = new Map();
+  for (const [r, c, ch, col0, tb, hs, hs2, x, y] of ENVC) {
+    const tau = tbn - tb;
+    if (tau >= 1.35) continue;
+    if (tau < 0) {
+      const vis = pin * 1.3 - hs * 0.5;
+      if (vis <= 0) continue;
+      let col = col0;
+      if (tbn > 0 && tau > -0.5) {
+        const w = (tau + 0.5) * 2;
+        col = mix(col, [.30, .10, .03], w * 0.75);
+        if (w > 0.6) col = mix(col, [1, .38, .05], (w - 0.6) * 1.3);
+      }
+      put(nw, r, c, ch, sc(col, Math.min(1, vis * 1.6)));
+      continue;
+    }
+    if (tau < 0.50) src.set(K(r, c), [r, c, 0.72 + 0.28 * rng()]);
+    else if (tau < 0.95) src.set(K(r, c), [r, c, (0.45 + 0.15 * rng()) * (1 - (tau - 0.50) / 0.45)]);
+    if (tau < 0.38) {
+      const q = tau / 0.38;
+      const T = clamp(0.98 - 0.62 * q + 0.14 * nz(t * 9 + hs * 20));
+      put(nw, r, c, (q < 0.6 ? "@#&%" : "#%=+")[Math.floor(hs2 * 4) % 4], LUT[Math.floor(T * 63)]);
+      front.push([x, y]);
+    } else {
+      const a = 1 - (tau - 0.38) / 0.97;
+      if (hs2 > a ** 0.7) continue;
+      if (pmod(hs * 37 + t * 1.6, 1) > 0.84 - 0.08 * a) put(nw, r, c, "*", LUT[Math.floor(clamp(0.28 + 0.5 * a) * 63)]);
+      else { const kk = 0.45 + 0.9 * a; put(nw, r, c, "%#="[Math.floor(hs * 3) % 3], [.13 * kk, .07 * kk, .05 * kk]); }
+    }
+  }
+
+  if (T_CUR1 - 0.3 <= t && t < T_BURN + 0.02) {
+    let mf;
+    if (t < T_CLICK) {
+      const k = 0.28 * ease((t - (T_CUR1 - 0.3)) / 0.3) * (0.8 + 0.2 * Math.sin(t * 9));
+      mf = col => mix(col, [1, .85, 1], k);
+    } else if (t < T_CLICK + 0.20) mf = col => sc(col, 0.62);
+    else { const k = 0.7 * (1 - clamp((t - T_CLICK - 0.2) / 0.15)); mf = col => mix(col, [1, .9, .8], k); }
+    for (const [r, c] of SEALC) {
+      const v = nw.get(K(r, c));
+      if (v) nw.set(K(r, c), { r, c, ch: v.ch, col: mf(v.col) });
+    }
+  }
+
+  const bk = bedK(t);
+  if (bk > 0.01) {
+    for (const [rr, cc, shp, hs, top] of BED) {
+      const fl = 0.5 + 0.5 * Math.sin(t * 6 + hs * 40);
+      const T = clamp(bk * shp * (0.25 + 0.45 * fl + 0.2 * hs));
+      if (T > 0.08) put(nw, rr, cc, "=%#@"[Math.floor(hs * 4) % 4], LUT[Math.floor(T * 63)]);
+      if (top) src.set(K(rr, cc), [rr, cc, bk * shp * (0.50 + 0.38 * rng())]);
+    }
+    for (const [rr, cc, shp, hs, top] of BED)
+      if (top && rng() < 0.5 * dt * 10 * bk * shp) front.push([(cc + 0.5) * CW, (rr + 0.5) * CH]);
+  }
+  for (const [k, v] of fireStep(src, t)) nw.set(k, v);
+
+  const rim = 0.65 * gt;
+  for (const q of ROSEC) {
+    if (t < q.tk) continue;
+    let ch = q.ch, col = q.col;
+    const heat = 1 - (t - q.tk);
+    if (heat > 0) {
+      const hh = heat ** 1.4;
+      col = mix(col, LUT[Math.floor(clamp(0.35 + 0.65 * hh) * 63)], clamp(hh * 1.15));
+      if (hh > 0.5) ch = "@";
+    } else if (q.ed && rim > 0.01) {
+      col = mix(col, [.72, .88, 1], rim);
+      if (q.hs > 0.9 && Math.sin(t * 3 + q.hs * 40) > 0.85) { ch = "*"; col = [.88, .96, 1]; }
+    }
+    put(nw, q.r, q.c, ch, col);
+  }
+
+  for (const f of RP) {
+    if (t < f.ts || t >= f.tk) continue;
+    const s = (t - f.ts) / (f.tk - f.ts);
+    for (const [lag, chh, dim] of [[0, "*", 1], [0.06, "+", 0.8], [0.12, ".", 0.6]]) {
+      const ss = s - lag;
+      if (ss < 0) break;
+      const [x, y] = fpos(f, ss), rr = Math.floor(y / CH), cc = Math.floor(x / CW);
+      if (inb(rr, cc)) put(nw, rr, cc, chh, LUT[Math.floor(clamp((0.45 + 0.55 * s) * dim) * 63)]);
+    }
+  }
+
+  if (t >= T_BURN && !st.burst) {
+    st.burst = true;
+    for (let i = 0; i < 150; i++) {
+      const a = uni(-170, -10) * D2R, sp = uni(100, 560) * S;
+      sparks.push([IGX, IGY, Math.cos(a) * sp, Math.sin(a) * sp, 0, uni(0.6, 1.6), -uni(20, 120) * S]);
+    }
+  }
+  if (front.length && t < T_FIRE_END) {
+    const n = Math.trunc(380 * dt * Math.min(1, front.length / 50) + rng());
+    for (let i = 0; i < n; i++) {
+      const [x, y] = front[ri(front.length)], a = uni(-125, -55) * D2R, sp = uni(60, 360) * S;
+      sparks.push([x, y, Math.cos(a) * sp, Math.sin(a) * sp, 0, uni(0.7, 1.9), -uni(25, 140) * S]);
+    }
+    if (rng() < 22 * dt) {
+      const [x, y] = front[ri(front.length)];
+      smoke.push([x, y - 0.05 * H, uni(-6, 6) * S, -uni(25, 55) * S, 0, uni(1.8, 3.2), uni(0, 6.28), SMOKE_C]);
+    }
+  }
+  if (t > T_R0 + T_FORM && gt > 0.2) {
+    const cnt = Math.trunc(6 * dt + rng());
+    for (let i = 0; i < cnt; i++)
+      sparks.push([RX + uni(-0.9, 0.9) * RR, RY + uni(-0.6, 0.9) * RR, uni(-12, 12) * S, -uni(25, 70) * S, 0, uni(1.2, 2.4), -8 * S]);
+  }
+  if (sparks.length > 1600) sparks.splice(0, sparks.length - 1600);
+
+  const aliveS = [];
+  for (const s of sparks) {
+    s[4] += dt;
+    if (s[4] >= s[5]) continue;
+    s[2] = s[2] * (1 - 1.3 * dt) + 55 * S * Math.sin(s[4] * 7 + s[5] * 20) * dt;
+    s[3] += s[6] * dt;
+    s[0] += s[2] * dt; s[1] += s[3] * dt;
+    const k = 1 - s[4] / s[5], rr = Math.floor(s[1] / CH), cc = Math.floor(s[0] / CW);
+    if (inb(rr, cc)) put(nw, rr, cc, k > 0.55 ? "*" : k > 0.30 ? "+" : ".", LUT[Math.floor(clamp(0.15 + 0.85 * k) * 63)]);
+    aliveS.push(s);
+  }
+  sparks = aliveS;
+
+  const aliveM = [];
+  for (const s of smoke) {
+    s[4] += dt;
+    if (s[4] >= s[5]) continue;
+    const k = s[4] / s[5];
+    s[0] += (s[2] + 14 * S * Math.sin(s[4] * 2.2 + s[6])) * dt;
+    s[1] += s[3] * dt;
+    const al = Math.sin(Math.PI * k) * 0.5, rr = Math.floor(s[1] / CH), cc = Math.floor(s[0] / CW);
+    if (al > 0.10 && inb(rr, cc)) {
+      const und = nw.get(K(rr, cc));
+      put(nw, rr, cc, ".:;+"[Math.min(3, Math.trunc(al * 7))], mix(und ? und.col : BG, s[7], al));
+    }
+    aliveM.push(s);
+  }
+  smoke = aliveM;
+
+  drawClick(t, dt, nw);
+  drawCursor(t, nw);
+  drawButton(t, nw);
+
+  ctx.fillStyle = hexc(BG);
+  ctx.fillRect(0, 0, W, H);
+  ctx.font = FONT;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const e of nw.values()) {
+    if (e.ch === " ") continue;
+    ctx.fillStyle = hexc(e.col);
+    ctx.fillText(e.ch, (e.c + 0.5) * CW, (e.r + 0.5) * CH);
+  }
+}
+
+const BTN_TXT = "ABRIR CARTA";
+const LETTER = `Para ti,
+
+Entre tantas melodías del mundo,
+mi favorita terminó siendo tu voz.
+Si la belleza tuviera nombre,
+seguramente llevaría el tuyo;
+si las estrellas pudieran sentir envidia,
+envidiarían la luz que hay en tus ojos.
+
+Tus rizos tienen el encanto de las cosas irrepetibles,
+cada uno parece tener su propia forma de brillar;
+y aunque el mundo estuviera lleno de maravillas,
+ninguna conseguiría hacerme dejar de admirarte.
+
+Tu sonrisa tiene esa extraña magia
+de hacer que hasta mis días grises florezcan,
+y no sé cómo explicarlo,
+pero hasta los momentos más sencillos
+se vuelven especiales cuando estás en ellos.
+
+No sé qué hicieron las estrellas
+para que el universo te regalara tanta belleza,
+pero agradezco infinitamente a la vida
+por permitirme coincidir contigo.
+
+Y si algún día dudas de lo maravillosa que eres,
+permíteme recordártelo una y mil veces:
+no existe poema que te haga justicia,
+ni palabras suficientes para describir cuánto te amo.
+
+Porque entre tantas personas,
+entre tantos caminos y casualidades,
+mi corazón tuvo la fortuna de encontrarte
+y la dicha inmensa de poder llamarte mía.
+
+Para ti, mi querida Ameri.
+Con todo mi amor. `;
+let btnHover = false;
+function btnRect() {
+  const BW = BTN_TXT.length + 4;
+  const c0 = Math.floor((COLS - BW) / 2), r0 = Math.round(0.935 * ROWS) - 1;
+  return { BW, c0, r0 };
+}
+const btnReady = () => last > T_R0 + T_FORM + 1.6;
+function drawButton(t, nw) {
+  const a = clamp((t - (T_R0 + T_FORM + 0.8)) / 0.8);
+  if (a <= 0) return;
+  const { BW, c0, r0 } = btnRect();
+  const pulse = 0.85 + 0.15 * Math.sin(t * 3);
+  const edge = sc([.95, .45, .66], a * pulse * (btnHover ? 1.25 : 1));
+  const text = sc(btnHover ? [1, .92, .97] : [1, .75, .85], a);
+  const line = "+" + "-".repeat(BW - 2) + "+";
+  const mid = "| " + BTN_TXT + " |";
+  for (let i = 0; i < BW; i++) {
+    put(nw, r0, c0 + i, line[i], edge);
+    put(nw, r0 + 2, c0 + i, line[i], edge);
+    put(nw, r0 + 1, c0 + i, mid[i], i === 0 || i === BW - 1 ? edge : text);
+  }
+}
+function overBtn(x, y) {
+  const { BW, c0, r0 } = btnRect();
+  return x >= c0 * CW && x < (c0 + BW) * CW && y >= r0 * CH && y < (r0 + 3) * CH;
+}
+const pointerPos = e => { const rc = canvas.getBoundingClientRect(); return [e.clientX - rc.left, e.clientY - rc.top]; };
+canvas.addEventListener("mousemove", e => {
+  const [x, y] = pointerPos(e);
+  btnHover = btnReady() && overBtn(x, y);
+  canvas.classList.toggle("hot", btnHover);
+});
+canvas.addEventListener("click", e => {
+  const [x, y] = pointerPos(e);
+  if (btnReady() && overBtn(x, y)) openCard();
+});
+function openCard() {
+  document.getElementById("letter").textContent = LETTER;
+  document.getElementById("card").classList.add("on");
+}
+function closeCard() { document.getElementById("card").classList.remove("on"); }
+document.getElementById("close").onclick = closeCard;
+document.getElementById("card").onclick = e => { if (e.target.id === "card") closeCard(); };
+
+function build() {
+  rng = makeRng(21);
+  frame = 0;
+  st = { burst: false, click: false, hot: false };
+  sparks = []; smoke = []; bits = []; BGC = new Map(); hexcache.clear();
+  const side = Math.max(320, Math.min(innerWidth - 16, innerHeight - 56, 960));
+  W = H = side;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  CH = H / ROWS;
+  COLS = Math.round(ROWS / 0.53);
+  CW = W / COLS;
+  S = H / 640;
+  CX = W / 2;
+  ctx.font = `100px "DotMatrix", ${MONO}`;
+  FONT = `${100 * CW / ctx.measureText("M").width}px "DotMatrix", ${MONO}`;
+  ctx.font = FONT;
+
+  _P = [...Array(256).keys()];
+  for (let i = 255; i > 0; i--) { const j = ri(i + 1); [_P[i], _P[j]] = [_P[j], _P[i]]; }
+  _N = Array.from({ length: 256 }, () => uni(-1, 1));
+  HS = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => rng()));
+  HS2 = Array.from({ length: ROWS }, () => Array.from({ length: COLS }, () => rng()));
+  HEAT = Array.from({ length: ROWS + 2 }, () => new Array(COLS).fill(0));
+
+  EW = 0.76 * W; EH = 0.74 * EW; ECY = 0.55 * H;
+  EX0 = CX - EW / 2; EX1 = CX + EW / 2; EY0 = ECY - EH / 2; EY1 = ECY + EH / 2;
+  FLAP_H = 0.50 * EH;
+  const TIPY = EY0 + FLAP_H;
+  HR = 0.062 * H; HCY = TIPY - 0.25 * HR;
+  XPL = CX - 0.17 * EW; XPR = CX + 0.17 * EW;
+  YPL = EY0 + FLAP_H * (1 - 0.17 * EW / (EW / 2));
+  IGX = CX; IGY = HCY;
+
+  const TEXT = "FOR YOU";
+  TXT = ["", "", "", "", ""];
+  [...TEXT].forEach((ch, i, arr) => { for (let k = 0; k < 5; k++) TXT[k] += GLYPH[ch][k] + (i < arr.length - 1 ? "." : ""); });
+  TW = TXT[0].length;
+  TC0 = Math.trunc(CX / CW - TW);
+  TR0 = Math.trunc((HCY + 1.2 * HR) / CH) + 2;
+
+  const raw = []; SHD = [];
+  for (let r = 0; r < ROWS; r++) {
+    const y = (r + 0.5) * CH;
+    for (let c = 0; c < COLS; c++) {
+      const x = (c + 0.5) * CW, s_ = envStyle(r, c, x, y, HS[r][c], HS2[r][c]);
+      if (s_) raw.push([r, c, s_[0], s_[1], x, y]);
+      else if (EX0 + 0.9 * CW <= x && x <= EX1 + 1.8 * CW && EY0 + 0.8 * CH <= y && y <= EY1 + 2.0 * CH) SHD.push([r, c, x, y]);
+    }
+  }
+  MAXD = Math.max(...raw.map(e => Math.hypot(e[4] - IGX, e[5] - IGY)));
+  ENVC = []; SEALC = [];
+  for (const [r, c, ch, col, x, y] of raw) {
+    const d = Math.hypot(x - IGX, y - IGY);
+    const nzv = vn(x * 0.035 + 4, y * 0.035 + 9) * 0.5 + 0.5;
+    const tb = T_SPREAD * (d / MAXD) ** 0.92 + 0.6 * nzv * Math.min(1, d / (0.12 * H));
+    ENVC.push([r, c, ch, col, tb, HS[r][c], HS2[r][c], x, y]);
+    if (inSeal(x, y)) SEALC.push([r, c]);
+  }
+  ENV_SORTED = [...ENVC].sort((a, b) => a[4] - b[4]);
+  TBS = ENV_SORTED.map(e => e[4]);
+  SHDC = SHD.map(([r, c, x, y]) => {
+    const d = Math.hypot(x - IGX, y - IGY), tb = T_SPREAD * (d / MAXD) ** 0.92;
+    const ex = Math.max(0, x - EX1, EX0 - x), ey = Math.max(0, y - EY1, EY0 - y);
+    const f = 1 - clamp(Math.hypot(ex, ey) / (2 * CW));
+    return [r, c, f > 0.45 ? ":" : ".", sc([.12, .08, .06], 0.35 + 0.65 * f), tb, HS[r][c]];
+  });
+
+  BED = [];
+  const RB0 = Math.trunc(EY1 / CH) + 1;
+  for (const rr of [RB0, RB0 + 1]) {
+    if (rr >= ROWS) continue;
+    for (let c = 0; c < COLS; c++) {
+      const x = (c + 0.5) * CW, u = 1 - ((x - CX) / (EW * 0.5)) ** 2;
+      if (u > 0.12) BED.push([rr, c, u ** 0.5, HS[rr][c], rr === RB0]);
+    }
+  }
+
+  RX = CX; RR = 0.175 * H; RY = 0.290 * H; STEM_Y1 = 0.885 * H;
+  HEAD_B = RY + 1.38 * RR; TOP_Y = RY - 1.1 * RR; STEM_HW = 0.8 * CW;
+  THORNS = [[0.60 * H, 1], [0.69 * H, -1], [0.77 * H, 1]];
+
+  const RAWR = [];
+  for (let r = 0; r < ROWS; r++) {
+    const y = (r + 0.5) * CH;
+    for (let c = 0; c < COLS; c++) {
+      const x = (c + 0.5) * CW, smp = roseSample(x, y);
+      if (smp) RAWR.push([r, c, smp, HS[r][c], HS2[r][c], x, y]);
+    }
+  }
+  ROSEMASK = new Set(RAWR.map(e => K(e[0], e[1])));
+  EDGE = new Set(); HALO = new Set();
+  for (const [r, c] of RAWR.map(e => [e[0], e[1]])) {
+    for (const [dr, dc] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) if (!ROSEMASK.has(K(r + dr, c + dc))) EDGE.add(K(r, c));
+    for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) if (!ROSEMASK.has(K(r + dr, c + dc))) HALO.add(K(r + dr, c + dc));
+  }
+  ROSEC = RAWR.map(([r, c, smp, hs, hs2, x, y]) => {
+    const [ch, col] = roseStyle(smp, hs, hs2);
+    const key = clamp((y - TOP_Y) / (STEM_Y1 - TOP_Y));
+    return { tk: T_R0 + 0.1 + key * T_FORM + rng() * 0.40, r, c, ch, col, x, y, ed: EDGE.has(K(r, c)), hs };
+  });
+  RP = ROSEC.map(q => {
+    const n = bisectRight(TBS, q.tk - T_BURN - 0.85);
+    const src = ENV_SORTED[ri(Math.max(1, n))];
+    let ts = Math.max(T_BURN + src[4] + 0.1, q.tk - 2.2);
+    ts = Math.min(ts, q.tk - 0.75);
+    const dx = q.x - src[7], dy = q.y - src[8], dd = Math.hypot(dx, dy) + 1e-6;
+    return { ts, tk: q.tk, sx: src[7], sy: src[8], tx: q.x, ty: q.y, nx: -dy / dd, ny: dx / dd,
+      amp: uni(-0.12, 0.12) * dd, lift: uni(0.05, 0.13) * H, ph: uni(0, 6.28) };
+  });
+
+  BGE = [];
+  for (let r = 0; r < ROWS; r++) {
+    const y = (r + 0.5) * CH;
+    for (let c = 0; c < COLS; c++) {
+      if (ROSEMASK.has(K(r, c))) continue;
+      const x = (c + 0.5) * CW, dx = x - RX, dy = y - RY;
+      const a = Math.atan2(dy, dx), dn = Math.hypot(dx, dy) / (0.55 * H);
+      BGE.push({ r, c, ab: Math.floor((a + Math.PI) / (2 * Math.PI) * NB) % NB, dn, halo: HALO.has(K(r, c)) });
+    }
+  }
+  BGCH = [[], [], []];
+  BGE.forEach((e, i) => BGCH[i % NCH].push(e));
+  RAYF = new Array(NB).fill(0); RAYM = new Array(NB).fill(0);
+
+  MOTES = Array.from({ length: 46 }, () => [uni(0, W), uni(0, H), uni(0.01, 0.04) * H, uni(0, 6.28), uni(0.5, 1)]);
+  STARS = [];
+  for (let i = 0; i < 60; i++) {
+    const rr = ri(ROWS), cc = ri(COLS);
+    if (!ROSEMASK.has(K(rr, cc))) STARS.push([rr, cc, uni(0, 6.28), uni(0.6, 2.2)]);
+  }
+
+  PH_ = 0.21 * H;
+  POLY = ARW.map(([x, y]) => [x * PH_, y * PH_]);
+  CUR_FILL = []; CUR_EDGE = []; CUR_GLOW = []; CUR_SHAD = [];
+  const occ = new Set();
+  const NC = Math.trunc(0.58 * PH_ / CW) + 3, NR = Math.trunc(PH_ / CH) + 3;
+  for (let j = 0; j < NR; j++) for (let i = 0; i < NC; i++) {
+    let cin = 0, core = 0;
+    for (const sy of [1 / 6, 3 / 6, 5 / 6]) for (const sx of [1 / 6, 3 / 6, 5 / 6]) {
+      const px = (i + sx) * CW, py = (j + sy) * CH;
+      if (pip(px, py)) { cin++; if (pdist(px, py) > 0.9 * CW) core++; }
+    }
+    const cxm = (i + 0.5) * CW, cym = (j + 0.5) * CH, h = ((j * 7 + i * 13) % 10) / 10;
+    if (core >= 5) {
+      let col = mix([.52, .22, .97], [1, .42, .74], clamp((cym / PH_) * 0.85 + (cxm / (0.58 * PH_)) * 0.15));
+      const bev = pdist(cxm, cym) < 1.8 * CW;
+      if (bev) col = mix(col, [1, .92, 1], 0.20);
+      CUR_FILL.push([j, i, bev ? "%" : "@", col, h]); occ.add(K(j, i));
+    } else if (cin >= 3) { CUR_EDGE.push([j, i, h]); occ.add(K(j, i)); }
+    else { const d = pdist(cxm, cym); if (d < 1.9 * CW) CUR_GLOW.push([j, i, 1 - d / (1.9 * CW), h]); }
+  }
+  for (const key of occ) {
+    const j = Math.floor(key / 4096), i = key % 4096;
+    if (!occ.has(K(j + 1, i + 1))) CUR_SHAD.push([j + 1, i + 1]);
+  }
+  TGX = CX - 0.004 * W; TGY = HCY - 0.015 * H;
+}
+
+function restart() {
+  t0 = performance.now(); last = 0;
+  st = { burst: false, click: false, hot: false };
+  sparks = []; smoke = []; bits = []; BGC.clear();
+  HEAT.forEach(row => row.fill(0));
+  for (const p of MOTES) p[1] = uni(0, H);
+}
+
+build();
+t0 = performance.now(); last = 0;
+document.fonts.load('100px "DotMatrix"').catch(() => {}).then(() => { build(); restart(); });
+addEventListener("keydown", e => {
+  if (e.key === "r" || e.key === "R") restart();
+  if (e.key === "Escape") closeCard();
+});
+let rz;
+addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => { build(); restart(); }, 200); });
+function loop(now) {
+  const t = (now - t0) / 1000, dt = clamp(t - last, 0, 0.1);
+  last = t;
+  render(t, dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
